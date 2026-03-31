@@ -1,0 +1,11 @@
+python-dotenv
+selenium
+gologin
+gspread
+pandas
+oauth2client
+pydrive
+pytz
+opencv-python
+pyotp
+slack-sdk

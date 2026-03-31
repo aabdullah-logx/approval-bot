@@ -21,6 +21,12 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+gologin_temp
+client_secret.json
+concise-faculty-419809-256ea1c757da.json
+white-resolver-420607-f75f9bef53d2.json
+drive_oauth2.dat
+sheets_oauth2.dat
 
 # Virtual environments
 venv/
