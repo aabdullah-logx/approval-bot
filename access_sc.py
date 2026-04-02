@@ -24,7 +24,6 @@ def load_web_driver_with_gologin(profile_id):
 
     import socket
 
-    # 🔥 CRITICAL: Use short path for Windows
     if platform == "win32":
         tmp_path = r"C:\gl"
     else:
@@ -44,20 +43,18 @@ def load_web_driver_with_gologin(profile_id):
     host, port = debugger_address.split(":")
     port = int(port)
 
-    # Wait for debugger
-    for i in range(40):
+    for i in range(60):
         try:
             with socket.create_connection((host, port), timeout=2):
                 print(f"✅ Debugger is ready on {host}:{port}")
                 break
         except Exception:
-            print(f"⏳ Waiting for debugger... ({i + 1}/40)")
+            print(f"⏳ Waiting for debugger... ({i+1}/60)")
             time.sleep(1)
     else:
         raise Exception("❌ GoLogin debugger not ready")
 
-    # 🔥 IMPORTANT: give Chrome time to stabilize
-    time.sleep(5)
+    time.sleep(10)
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
@@ -76,9 +73,14 @@ def load_web_driver_with_gologin(profile_id):
     chrome_options.add_argument("--disable-features=site-per-process")
     chrome_options.add_argument("--remote-allow-origins=*")
 
+    # Extra stability for Windows
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--disable-logging")
+    chrome_options.add_argument("--log-level=3")
+    chrome_options.add_argument("--silent")
+    chrome_options.add_argument("--disable-crash-reporter")
+    chrome_options.add_argument("--disable-in-process-stack-traces")
     chrome_options.add_argument("--window-size=1920,1080")
-
-    # =========================
 
     if platform == "win32":
         local_chromedriver_path = os.getenv('CHROMEDRIVER_WINDOWS', 'chromedriver.exe')
@@ -88,6 +90,10 @@ def load_web_driver_with_gologin(profile_id):
         local_chromedriver_path = os.getenv('CHROMEDRIVER_MAC', './chromedriver')
 
     print(f"Using ChromeDriver: {local_chromedriver_path}")
+
+    # Verify that chromedriver exists
+    if not os.path.isfile(local_chromedriver_path):
+        raise FileNotFoundError(f"ChromeDriver not found at {local_chromedriver_path}")
 
     try:
         driver = webdriver.Chrome(
@@ -99,6 +105,14 @@ def load_web_driver_with_gologin(profile_id):
         print("❌ Failed to connect Selenium to GoLogin")
         gl.stop()
         raise e
+
+    # Verify the session is alive
+    try:
+        driver.current_url
+    except Exception:
+        print("❌ New driver session is already dead")
+        gl.stop()
+        raise Exception("Driver session died immediately after creation")
 
     return driver, gl
 
