@@ -80,7 +80,8 @@ def load_web_driver_with_gologin(profile_id):
     chrome_options.add_argument("--silent")
     chrome_options.add_argument("--disable-crash-reporter")
     chrome_options.add_argument("--disable-in-process-stack-traces")
-    chrome_options.add_argument("--window-size=1920,1080")
+    # The following line may be ignored, but kept for completeness
+    chrome_options.add_argument("--window-size=1280,720")
 
     if platform == "win32":
         local_chromedriver_path = os.getenv('CHROMEDRIVER_WINDOWS', 'chromedriver.exe')
@@ -91,7 +92,6 @@ def load_web_driver_with_gologin(profile_id):
 
     print(f"Using ChromeDriver: {local_chromedriver_path}")
 
-    # Verify that chromedriver exists
     if not os.path.isfile(local_chromedriver_path):
         raise FileNotFoundError(f"ChromeDriver not found at {local_chromedriver_path}")
 
@@ -113,6 +113,10 @@ def load_web_driver_with_gologin(profile_id):
         print("❌ New driver session is already dead")
         gl.stop()
         raise Exception("Driver session died immediately after creation")
+
+    driver.set_window_size(1280, 720)
+    driver.set_window_position(0, 0)
+    print("✅ Window resized to 1280x720")
 
     return driver, gl
 
