@@ -24,7 +24,12 @@ def load_web_driver_with_gologin(profile_id):
 
     import socket
 
-    tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
+    # 🔥 CRITICAL: Use short path for Windows
+    if platform == "win32":
+        tmp_path = r"C:\gl"
+    else:
+        tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
+
     os.makedirs(tmp_path, exist_ok=True)
 
     gl = GoLogin({
@@ -39,24 +44,41 @@ def load_web_driver_with_gologin(profile_id):
     host, port = debugger_address.split(":")
     port = int(port)
 
-    max_retries = 40
-    for i in range(max_retries):
+    # Wait for debugger
+    for i in range(40):
         try:
             with socket.create_connection((host, port), timeout=2):
                 print(f"✅ Debugger is ready on {host}:{port}")
                 break
         except Exception:
-            print(f"⏳ Waiting for debugger... ({i + 1}/{max_retries})")
+            print(f"⏳ Waiting for debugger... ({i + 1}/40)")
             time.sleep(1)
     else:
-        raise Exception(f"❌ GoLogin debugger not ready after {max_retries} seconds")
+        raise Exception("❌ GoLogin debugger not ready")
 
+    # 🔥 IMPORTANT: give Chrome time to stabilize
     time.sleep(5)
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
-    chrome_options.add_argument("start-maximized")
-    chrome_options.add_argument("--window-size=1920x1080")
+
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--metrics-recording-only")
+    chrome_options.add_argument("--mute-audio")
+    chrome_options.add_argument("--no-first-run")
+    chrome_options.add_argument("--disable-features=site-per-process")
+    chrome_options.add_argument("--remote-allow-origins=*")
+
+    chrome_options.add_argument("--window-size=1920,1080")
+
+    # =========================
 
     if platform == "win32":
         local_chromedriver_path = os.getenv('CHROMEDRIVER_WINDOWS', 'chromedriver.exe')
