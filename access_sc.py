@@ -19,16 +19,14 @@ import re
 load_dotenv()
 
 
-
-
-
 def load_web_driver_with_gologin(profile_id):
     print(f"Launching GoLogin profile: {profile_id}")
-    # Set a custom tmpdir to avoid path length or permission issues in Windows Temp
+
+    import socket
+
     tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
-    if not os.path.exists(tmp_path):
-        os.makedirs(tmp_path)
-        
+    os.makedirs(tmp_path, exist_ok=True)
+
     gl = GoLogin({
         'token': settings.token,
         'profile_id': profile_id,
@@ -36,7 +34,24 @@ def load_web_driver_with_gologin(profile_id):
     })
 
     debugger_address = gl.start()
-    time.sleep(10)
+    print(f"Debugger address: {debugger_address}")
+
+    host, port = debugger_address.split(":")
+    port = int(port)
+
+    max_retries = 40
+    for i in range(max_retries):
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                print(f"✅ Debugger is ready on {host}:{port}")
+                break
+        except Exception:
+            print(f"⏳ Waiting for debugger... ({i+1}/{max_retries})")
+            time.sleep(1)
+    else:
+        raise Exception(f"❌ GoLogin debugger not ready after {max_retries} seconds")
+
+    time.sleep(5)
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
@@ -50,7 +65,19 @@ def load_web_driver_with_gologin(profile_id):
     else:
         local_chromedriver_path = os.getenv('CHROMEDRIVER_MAC', './chromedriver')
 
-    driver = webdriver.Chrome(service=Service(local_chromedriver_path), options=chrome_options)
+    print(f"Using ChromeDriver: {local_chromedriver_path}")
+
+    try:
+        driver = webdriver.Chrome(
+            service=Service(local_chromedriver_path),
+            options=chrome_options
+        )
+        print("✅ Selenium connected to GoLogin successfully")
+    except Exception as e:
+        print("❌ Failed to connect Selenium to GoLogin")
+        gl.stop()
+        raise e
+
     return driver, gl
 
 
