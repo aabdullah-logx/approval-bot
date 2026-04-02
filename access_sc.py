@@ -36,6 +36,7 @@ def load_web_driver_with_gologin(profile_id):
     })
 
     debugger_address = gl.start()
+    time.sleep(10)
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
@@ -54,16 +55,22 @@ def load_web_driver_with_gologin(profile_id):
 
 
 def open_approval_required_inventory(driver, base_url, page_number=1):
-    """Open inventory page with approval required filter applied."""
     page_size = 10
     inventory_url = f"{base_url}myinventory/inventory/views/fix-issues?fulfilledBy=all&pageSize={page_size}&sort=date_created_desc&status=approval_required&page={page_number}"
-    
+
     print(f"Opening approval required inventory page {page_number}...")
     driver.get(inventory_url)
-    time.sleep(6)
-    
-    return inventory_url
 
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script(
+                "return document.querySelectorAll('div[data-sku]').length"
+            ) > 0
+        )
+    except:
+        print("⚠️ Timeout waiting for products")
+
+    return inventory_url
 
 def check_and_log_document_requirements(driver, asin, title, sku, worksheet=None):
     """Check what documents are required on the current page and log to Google Sheets."""
@@ -498,6 +505,7 @@ def process_approval_page(driver, asin, title, sku, worksheet=None):
     # print(f"  Current page: {page_title}")
     
     # Check page content
+
     try:
         page_info = driver.execute_script("""
         var bodyText = document.body.innerText.toLowerCase();
