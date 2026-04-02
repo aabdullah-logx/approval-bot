@@ -10,10 +10,8 @@ import settings
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
 import pandas as pd
 from dotenv import load_dotenv
-import re
 
 # Load environment variables
 load_dotenv()
@@ -21,11 +19,10 @@ load_dotenv()
 
 def load_web_driver_with_gologin(profile_id):
     print(f"Launching GoLogin profile: {profile_id}")
-
-    import socket
-
+    # Set a custom tmpdir to avoid path length or permission issues in Windows Temp
     tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
-    os.makedirs(tmp_path, exist_ok=True)
+    if not os.path.exists(tmp_path):
+        os.makedirs(tmp_path)
 
     gl = GoLogin({
         'token': settings.token,
@@ -34,24 +31,6 @@ def load_web_driver_with_gologin(profile_id):
     })
 
     debugger_address = gl.start()
-    print(f"Debugger address: {debugger_address}")
-
-    host, port = debugger_address.split(":")
-    port = int(port)
-
-    max_retries = 40
-    for i in range(max_retries):
-        try:
-            with socket.create_connection((host, port), timeout=2):
-                print(f"✅ Debugger is ready on {host}:{port}")
-                break
-        except Exception:
-            print(f"⏳ Waiting for debugger... ({i+1}/{max_retries})")
-            time.sleep(1)
-    else:
-        raise Exception(f"❌ GoLogin debugger not ready after {max_retries} seconds")
-
-    time.sleep(5)
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
@@ -65,46 +44,256 @@ def load_web_driver_with_gologin(profile_id):
     else:
         local_chromedriver_path = os.getenv('CHROMEDRIVER_MAC', './chromedriver')
 
-    print(f"Using ChromeDriver: {local_chromedriver_path}")
-
-    try:
-        driver = webdriver.Chrome(
-            service=Service(local_chromedriver_path),
-            options=chrome_options
-        )
-        print("✅ Selenium connected to GoLogin successfully")
-    except Exception as e:
-        print("❌ Failed to connect Selenium to GoLogin")
-        gl.stop()
-        raise e
-
+    driver = webdriver.Chrome(service=Service(local_chromedriver_path), options=chrome_options)
     return driver, gl
 
 
-def open_approval_required_inventory(driver, base_url, page_number=1):
-    page_size = 10
-    inventory_url = f"{base_url}myinventory/inventory/views/fix-issues?fulfilledBy=all&pageSize={page_size}&sort=date_created_desc&status=approval_required&page={page_number}"
+def extract_asins(driver):
+    """Extract all Inactive ASINs from the current inventory page."""
 
-    print(f"Opening approval required inventory page {page_number}...")
-    driver.get(inventory_url)
+    print("\nExtracting ASINs from page...")
 
-    try:
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script(
-                "return document.querySelectorAll('div[data-sku]').length"
-            ) > 0
-        )
-    except:
-        print("⚠️ Timeout waiting for products")
+    asins_info = driver.execute_script(r"""
+    var asins_info = {};
+    var seen = {};
+    var debugInfo = [];
 
-    return inventory_url
+    // Noise words that are NOT part of a title or SKU
+    var NOISE_WORDS = ['inactive', 'active', 'performance', 'price', 'quantity',
+                       'available', 'fix listing', 'approval', 'status', 'suppressed',
+                       'stranded', 'your price', 'net proceeds', 'days', 'units',
+                       'issues', 'listing', 'fee', 'condition', 'new', 'used',
+                       'edit', 'delete', 'close', 'more', 'add a product'];
+
+    function isNoise(line) {
+        var low = line.toLowerCase().trim();
+        if (low.length < 5) return true;
+        for (var n = 0; n < NOISE_WORDS.length; n++) {
+            if (low === NOISE_WORDS[n]) return true;
+        }
+        // Skip lines that are just numbers, currency, dates or very short
+        if (/^[\$\d\.\,\%\s\-\/]+$/.test(line)) return true;
+        // Skip if starts with ASIN or SKU
+        if (/^(ASIN|SKU)/i.test(low)) return true;
+        return false;
+    }
+
+    function findRows() {
+        var rawRows = document.querySelectorAll('tr, mt-row, [role="row"], .mt-row, .kat-table-row');
+        if (rawRows.length > 0) return rawRows;
+        return [document.body];
+    }
+
+    function getTitleFromLines(lines, asinLineIdx) {
+        var title = 'Unknown';
+        if (asinLineIdx > 0) {
+            var titleCandidates = [];
+            for (var j = 0; j < asinLineIdx; j++) {
+                var candidate = lines[j].trim();
+                if (!isNoise(candidate) && candidate.length > 8) {
+                    titleCandidates.push(candidate);
+                }
+            }
+            if (titleCandidates.length > 0) {
+                title = titleCandidates.reduce(function(a, b){ return a.length >= b.length ? a : b; });
+                title = title.substring(0, 200);
+            }
+        }
+        return title;
+    }
+
+    // Build ASIN -> Title from product links like https://www.amazon.ca/dp/B09SPRN8GD
+    var asinTitleMap = {};
+    var productAnchors = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
+    for (var p = 0; p < productAnchors.length; p++) {
+        var hrefP = productAnchors[p].getAttribute('href') || '';
+        var asinFromDp = hrefP.match(/\/dp\/([A-Z0-9]{10})(?:[\/?#]|$)/i);
+        var asinFromGp = hrefP.match(/\/gp\/product\/([A-Z0-9]{10})(?:[\/?#]|$)/i);
+        var asinP = asinFromDp ? asinFromDp[1] : (asinFromGp ? asinFromGp[1] : null);
+        if (!asinP) continue;
+
+        asinP = asinP.toUpperCase();
+        var titleP = (productAnchors[p].innerText || '').trim();
+        if (!titleP || isNoise(titleP) || titleP.length < 8) continue;
+
+        if (!asinTitleMap[asinP] || titleP.length > asinTitleMap[asinP].length) {
+            asinTitleMap[asinP] = titleP.substring(0, 200);
+        }
+    }
+
+    // Build ASIN -> SKU by starting from each SKU link, then finding ASIN in its nearest product container.
+    var asinSkuMap = {};
+    var skuAnchors = document.querySelectorAll('a[href*="mSku="]');
+    for (var x = 0; x < skuAnchors.length; x++) {
+        var hrefX = skuAnchors[x].getAttribute('href') || '';
+        var skuMatchX = hrefX.match(/[?&]mSku=([^&#]+)/i);
+        if (!skuMatchX || !skuMatchX[1]) continue;
+
+        var skuValue = decodeURIComponent(skuMatchX[1]).trim().substring(0, 100);
+        if (!skuValue) continue;
+
+        var container = skuAnchors[x].closest('tr, mt-row, [role="row"], .mt-row, .kat-table-row, li, .a-row, .a-section');
+        var probe = container || skuAnchors[x].parentElement;
+        var asinInContainer = null;
+        var containerText = '';
+
+        // Walk up a few levels to find the nearest node that contains ASIN text.
+        for (var depth = 0; depth < 8 && probe; depth++) {
+            containerText = probe.innerText || '';
+            asinInContainer = containerText.match(/ASIN[\s:]*([A-Z0-9]{10})/i);
+            if (asinInContainer && asinInContainer[1]) {
+                break;
+            }
+            probe = probe.parentElement;
+        }
+
+        if (asinInContainer && asinInContainer[1]) {
+            var mappedAsin = asinInContainer[1].toUpperCase();
+            asinSkuMap[mappedAsin] = skuValue;
+
+            if (!seen[mappedAsin]) {
+                seen[mappedAsin] = true;
+                var linesX = containerText
+                    .split(/\r?\n/)
+                    .map(function(l){ return l.trim(); })
+                    .filter(function(l){ return l.length > 0; });
+
+                var asinLineIdxX = -1;
+                for (var ix = 0; ix < linesX.length; ix++) {
+                    if (linesX[ix].indexOf(mappedAsin) !== -1 && /ASIN/i.test(linesX[ix])) {
+                        asinLineIdxX = ix;
+                        break;
+                    }
+                }
+
+                var titleX = asinTitleMap[mappedAsin] || getTitleFromLines(linesX, asinLineIdxX);
+                titleX = titleX.replace(/,/g, ' ');
+                asins_info[mappedAsin] = {'sku': skuValue.replace(/,/g, ' '), 'title': titleX};
+            }
+        }
+    }
+
+    var rows = findRows();
+    debugInfo.push('Total rows found: ' + rows.length);
+    debugInfo.push('ASIN->Title links mapped: ' + Object.keys(asinTitleMap).length);
+    debugInfo.push('ASIN->SKU links mapped: ' + Object.keys(asinSkuMap).length);
+
+    rows.forEach(function(r) {
+        var txt = r.innerText || '';
+        if (txt.indexOf('ASIN') === -1) return;
+
+        // Split by newlines (handles \n and \r\n)
+        var lines = txt.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 0; });
+
+        // Find ASINs using broad search on full text (like the old working code)
+        var asinRegex = /ASIN[\s:]*([A-Z0-9]{10})/gi;
+        var match;
+        while ((match = asinRegex.exec(txt)) !== null) {
+            var asin = match[1].toUpperCase();
+            if (seen[asin]) continue;
+            seen[asin] = true;
+
+            // Find which line index contains this ASIN
+            var asinLineIdx = -1;
+            for (var i = 0; i < lines.length; i++) {
+                if (lines[i].indexOf(asin) !== -1 && /ASIN/i.test(lines[i])) {
+                    asinLineIdx = i;
+                    break;
+                }
+            }
+
+            debugInfo.push('ASIN ' + asin + ' found at line index ' + asinLineIdx + ' of ' + lines.length);
+            if (asinLineIdx >= 0 && asinLineIdx < 5) {
+                debugInfo.push('  Lines around ASIN: ' + JSON.stringify(lines.slice(0, Math.min(asinLineIdx + 4, lines.length))));
+            }
+
+            // --- Extract SKU ---
+            var sku = asinSkuMap[asin] || 'Unknown';
+
+            // Priority 1 fallback: find SKU from skucentral link in the same row/container
+            if (sku === 'Unknown') {
+                var rowLinks = r.querySelectorAll('a[href*="mSku="]');
+                for (var a = 0; a < rowLinks.length; a++) {
+                    var href = rowLinks[a].getAttribute('href') || '';
+                    var skuFromHref = href.match(/[?&]mSku=([^&#]+)/i);
+                    if (skuFromHref && skuFromHref[1]) {
+                        sku = decodeURIComponent(skuFromHref[1]).trim().substring(0, 100);
+                        break;
+                    }
+                    var linkText = (rowLinks[a].innerText || '').trim();
+                    if (linkText && /^[A-Z0-9\-_]{6,}$/i.test(linkText)) {
+                        sku = linkText.substring(0, 100);
+                        break;
+                    }
+                }
+            }
+
+            // Priority 2 (fallback): search lines near/after the ASIN line for SKU label
+            if (sku === 'Unknown') {
+                var searchStart = Math.max(0, asinLineIdx);
+                var searchEnd = Math.min(lines.length, asinLineIdx + 5);
+                for (var s = searchStart; s < searchEnd; s++) {
+                    var skuMatch = lines[s].match(/SKU[\s:]+(.+)/i);
+                    if (skuMatch) {
+                        var rawSku = skuMatch[1].trim();
+                        // Take only first chunk (stop at double-space or tab)
+                        var skuParts = rawSku.split(/\s{2,}|\t/);
+                        sku = skuParts[0].trim().substring(0, 100);
+                        break;
+                    }
+                }
+            }
+
+            // --- Extract Title ---
+            // Title is typically BEFORE the ASIN line in the row text
+            var title = asinTitleMap[asin] || getTitleFromLines(lines, asinLineIdx);
+
+            title = title.replace(/,/g, ' ');
+            sku   = sku.replace(/,/g, ' ');
+
+            asins_info[asin] = {'sku': sku, 'title': title};
+        }
+    });
+
+    // Fallback: scan HTML for ASINs if nothing found via row parsing
+    if (Object.keys(asins_info).length === 0) {
+        debugInfo.push('FALLBACK: No ASINs from rows, scanning HTML...');
+        var htmlText = document.body.innerHTML || '';
+        var regex2 = /asin[=:\s"']+([A-Z0-9]{10})/gi;
+        var match2;
+        while ((match2 = regex2.exec(htmlText)) !== null) {
+            var asin2 = match2[1].toUpperCase();
+            if (!seen[asin2]) {
+                seen[asin2] = true;
+                asins_info[asin2] = {'sku': 'Unknown', 'title': 'Unknown'};
+            }
+        }
+    }
+
+    return {'data': asins_info, 'debug': debugInfo};
+    """)
+
+    # Print debug info
+    debug = asins_info.get('debug', [])
+    for d in debug:
+        print(f"  [DEBUG] {d}")
+
+    actual_data = asins_info.get('data', {})
+    print(f"  Found {len(actual_data)} ASINs mapping.")
+
+    # Print first few entries for verification
+    for asin, info in list(actual_data.items())[:3]:
+        print(f"    {asin} -> Title: {info.get('title', '?')[:60]}  |  SKU: {info.get('sku', '?')}")
+
+    return actual_data
+
 
 def check_and_log_document_requirements(driver, asin, title, sku, worksheet=None):
     """Check what documents are required on the current page and log to Google Sheets."""
     try:
         reqs = driver.execute_script("""
             var requirements = [];
-            
+
             // Check for Transparency Serial Number (in body or shadow roots)
             var bodyText = (document.body.innerText || "").toLowerCase();
             if (bodyText.includes("transparency serial number") || bodyText.includes("transparency listing application")) {
@@ -141,14 +330,14 @@ def check_and_log_document_requirements(driver, asin, title, sku, worksheet=None
             }
             return [...new Set(requirements.filter(Boolean))];
         """)
-        
+
         status = "unknown"
         if reqs:
             status = "other_docs_needed"
-            
+
             has_invoice = False
             has_transparency = False
-            
+
             for req in reqs:
                 if 'transparency serial number' in req.lower() or 'transparency listing' in req.lower():
                     has_transparency = True
@@ -159,380 +348,41 @@ def check_and_log_document_requirements(driver, asin, title, sku, worksheet=None
                 status = "transparency_number_required"
             elif has_invoice:
                 status = "invoice_needed"
-        
+
         doc_string = " | ".join(reqs) if reqs else "None detected"
-        
-        # Log to Google Sheets
+        # print(f"ASIN {asin} Documents required: {doc_string} -> Logged as: {status}")
+
+        # Log to worksheet if available
         if worksheet:
             try:
                 worksheet.append_row([asin, sku, title, status])
-                print(f"  Saved to Google Sheet: {asin} -> {status}")
             except Exception as w_err:
                 print(f"  Error appending to worksheet: {w_err}")
-            
+
     except Exception as e:
         print(f"  Error checking documents: {e}")
 
 
-def extract_first_product_and_click_fix_listing(driver, product_index=0):
-    """Click 'Fix listing issue' on the Nth product row, wait for sidebar panel to open,
-    then extract ASIN, SKU, and Title from the sidebar panel content.
-    
-    Flow:
-    1. Find div[data-sku] product row at given index
-    2. Click its kat-link[label='Fix listing issue'] 
-    3. Wait for sidebar panel (kat-panel / div[role='dialog']) to open
-    4. Extract ASIN, SKU, Title from sidebar content
-    """
-    try:
-        # print(f"  Step 1: Clicking 'Fix listing issue' on product {product_index + 1}...")
-        
-        # Click "Fix listing issue" on the Nth product row
-        click_result = driver.execute_script("""
-            var result = {success: false, method: 'not found', debug: []};
-            var idx = arguments[0];
-            
-            // Get the product row at given index
-            var productRows = document.querySelectorAll('div[data-sku]');
-            result.debug.push('Found ' + productRows.length + ' product rows');
-            
-            if (productRows.length === 0 || idx >= productRows.length) {
-                result.debug.push('No product row found at index ' + idx);
-                return result;
-            }
-            var firstRow = productRows[idx];
-            result.debug.push('Row ' + idx + ' SKU: ' + firstRow.getAttribute('data-sku'));
-            
-            // Find kat-link with label="Fix listing issue" inside this row
-            var katLink = firstRow.querySelector('kat-link[label="Fix listing issue"]');
-            if (!katLink) {
-                var allKatLinks = firstRow.querySelectorAll('kat-link');
-                for (var i = 0; i < allKatLinks.length; i++) {
-                    var lbl = (allKatLinks[i].getAttribute('label') || '').toLowerCase();
-                    if (lbl.includes('fix listing')) {
-                        katLink = allKatLinks[i];
-                        break;
-                    }
-                }
-            }
-            
-            result.debug.push('kat-link found: ' + (katLink ? 'YES' : 'NO'));
-            
-            if (katLink) {
-                // Click the anchor inside shadow DOM
-                if (katLink.shadowRoot) {
-                    var shadowAnchor = katLink.shadowRoot.querySelector('a');
-                    if (shadowAnchor) {
-                        shadowAnchor.click();
-                        result.success = true;
-                        result.method = 'shadow DOM anchor click';
-                        return result;
-                    }
-                }
-                // Fallback: direct click
-                katLink.click();
-                result.success = true;
-                result.method = 'direct click';
-                return result;
-            }
-            
-            // Fallback: search all kat-links on page
-            var allPageLinks = document.querySelectorAll('kat-link[label="Fix listing issue"]');
-            result.debug.push('Page-level kat-links: ' + allPageLinks.length);
-            if (allPageLinks.length > idx) {
-                var link = allPageLinks[idx];
-                if (link.shadowRoot) {
-                    var sa = link.shadowRoot.querySelector('a');
-                    if (sa) { sa.click(); result.success = true; result.method = 'page-level shadow click'; return result; }
-                }
-                link.click();
-                result.success = true;
-                result.method = 'page-level direct click';
-                return result;
-            }
-            
-            result.debug.push('No Fix listing issue link found at index ' + idx);
-            return result;
-        """, product_index)
-        
-        if not click_result.get('success'):
-            print(f"  Failed to click 'Fix listing issue' on product {product_index + 1}")
-            return None
-        
-        time.sleep(18)
-        
-        panel_data = driver.execute_script("""
-            var result = {asin: null, sku: null, title: null, debug: [], panel_found: false};
-            
-            // Find the sidebar panel - it's a kat-panel element
-            var panel = document.querySelector('kat-panel');
-            if (!panel) {
-                panel = document.querySelector('[role="dialog"][aria-label="panel"]');
-            }
-            if (!panel) {
-                var dialogs = document.querySelectorAll('[role="dialog"]');
-                for (var d = 0; d < dialogs.length; d++) {
-                    if (dialogs[d].offsetParent !== null || dialogs[d].style.display !== 'none') {
-                        panel = dialogs[d];
-                        break;
-                    }
-                }
-            }
-            
-            if (!panel) {
-                result.debug.push('No sidebar panel found');
-                return result;
-            }
-            
-            result.panel_found = true;
-            result.debug.push('Sidebar panel found: ' + panel.tagName);
-            
-            // For kat-panel: content is in light DOM (children of kat-panel element)
-            // But innerText on the host may return empty due to shadow DOM slots
-            // So we need to get text from the light DOM children directly
-            var panelText = '';
-            
-            // Method 1: Try getting text from light DOM children of kat-panel
-            var children = panel.children;
-            for (var c = 0; c < children.length; c++) {
-                panelText += (children[c].innerText || children[c].textContent || '') + '\\n';
-            }
-            
-            // Method 2: If still empty, try shadow root's .content slot
-            if (panelText.trim().length === 0 && panel.shadowRoot) {
-                result.debug.push('Light DOM empty, checking shadow root...');
-                var contentDiv = panel.shadowRoot.querySelector('.content');
-                if (contentDiv) {
-                    var slot = contentDiv.querySelector('slot');
-                    if (slot) {
-                        var assigned = slot.assignedNodes();
-                        result.debug.push('Slot assigned nodes: ' + assigned.length);
-                        for (var a = 0; a < assigned.length; a++) {
-                            panelText += (assigned[a].innerText || assigned[a].textContent || '') + '\\n';
-                        }
-                    }
-                    // Also try direct content text
-                    if (panelText.trim().length === 0) {
-                        panelText = (contentDiv.innerText || contentDiv.textContent || '');
-                    }
-                }
-                // Also try the entire shadow root text
-                if (panelText.trim().length === 0) {
-                    panelText = (panel.shadowRoot.textContent || '');
-                }
-            }
-            
-            // Method 3: If still empty, try innerHTML parsing
-            if (panelText.trim().length === 0) {
-                panelText = (panel.innerText || panel.textContent || '');
-            }
-            
-            result.debug.push('Panel text length: ' + panelText.length);
-            
-            // Extract ASIN - look for pattern ASIN: XXXXXXXXXX or ASIN XXXXXXXXXX
-            var asinMatch = panelText.match(/ASIN[:\\s]+([A-Z0-9]{10})/);
-            if (asinMatch) {
-                result.asin = asinMatch[1];
-                result.debug.push('ASIN from panel text: ' + result.asin);
-            }
-            
-            // Extract SKU - look for pattern SKU: XXXX or SKU XXXX
-            var skuMatch = panelText.match(/SKU[:\\s]+([^\\s\\n]+)/);
-            if (skuMatch) {
-                result.sku = skuMatch[1];
-                result.debug.push('SKU from panel text: ' + result.sku);
-            }
-            
-            // Extract Title - look for product link with /dp/ href
-            var titleLink = panel.querySelector('a[href*="/dp/"][target="_blank"]');
-            if (titleLink) {
-                result.title = (titleLink.innerText || titleLink.textContent || '').trim();
-                result.debug.push('Title from panel link: ' + (result.title || '').substring(0, 60));
-                
-                // Also get ASIN from href if not found yet
-                if (!result.asin) {
-                    var hrefMatch = titleLink.getAttribute('href').match(/\\/dp\\/([A-Z0-9]{10})/);
-                    if (hrefMatch) {
-                        result.asin = hrefMatch[1];
-                        result.debug.push('ASIN from panel href: ' + result.asin);
-                    }
-                }
-            }
-            
-            // If title not found via link, look for product name in panel
-            if (!result.title) {
-                // Try h1, h2, h3 headings
-                var headings = panel.querySelectorAll('h1, h2, h3, h4');
-                for (var h = 0; h < headings.length; h++) {
-                    var hText = (headings[h].innerText || '').trim();
-                    if (hText.length > 10 && !hText.toLowerCase().includes('fix') && !hText.toLowerCase().includes('approval')) {
-                        result.title = hText;
-                        result.debug.push('Title from heading: ' + hText.substring(0, 60));
-                        break;
-                    }
-                }
-            }
-            
-            // If title still not found, try bold/strong text or first long text in panel
-            if (!result.title) {
-                var boldTexts = panel.querySelectorAll('b, strong, [class*="title"], [class*="Title"]');
-                for (var b = 0; b < boldTexts.length; b++) {
-                    var bText = (boldTexts[b].innerText || '').trim();
-                    if (bText.length > 15 && !bText.toLowerCase().includes('fix') && !bText.toLowerCase().includes('listing status')) {
-                        result.title = bText;
-                        result.debug.push('Title from bold text: ' + bText.substring(0, 60));
-                        break;
-                    }
-                }
-            }
-            
-            // Also try all links in panel for title
-            if (!result.title) {
-                var panelLinks = panel.querySelectorAll('a[target="_blank"]');
-                for (var pl = 0; pl < panelLinks.length; pl++) {
-                    var plText = (panelLinks[pl].innerText || '').trim();
-                    if (plText.length > 15) {
-                        result.title = plText;
-                        result.debug.push('Title from panel link (fallback): ' + plText.substring(0, 60));
-                        break;
-                    }
-                }
-            }
-            
-            // Extract from span elements near ASIN/SKU labels
-            if (!result.asin || !result.sku) {
-                var spans = panel.querySelectorAll('span, div');
-                for (var s = 0; s < spans.length; s++) {
-                    var sText = (spans[s].innerText || '').trim();
-                    if (sText === 'ASIN' && !result.asin && spans[s].nextElementSibling) {
-                        var nextText = (spans[s].nextElementSibling.innerText || '').trim();
-                        if (/^[A-Z0-9]{10}$/.test(nextText)) {
-                            result.asin = nextText;
-                            result.debug.push('ASIN from span sibling: ' + nextText);
-                        }
-                    }
-                    if (sText === 'SKU' && !result.sku && spans[s].nextElementSibling) {
-                        var nextSkuText = (spans[s].nextElementSibling.innerText || '').trim();
-                        if (nextSkuText.length > 0) {
-                            result.sku = nextSkuText;
-                            result.debug.push('SKU from span sibling: ' + nextSkuText);
-                        }
-                    }
-                }
-            }
-            
-            // Log first 300 chars of panel text for debugging
-            result.debug.push('Panel text preview: ' + panelText.substring(0, 300).replace(/\\n/g, ' | '));
-            
-            return result;
-        """)
-        
-        asin = panel_data.get('asin')
-        sku = panel_data.get('sku')
-        title = panel_data.get('title')
-        panel_found = panel_data.get('panel_found', False)
-        
-        # If any essential data is missing, use the table row as a fallback
-        if not panel_found or not asin or not sku or not title:
-            if not panel_found:
-                print("  WARNING: Sidebar panel not found!")
-                
-            fallback = driver.execute_script("""
-                var row = document.querySelectorAll('div[data-sku]')[0];
-                if (!row) return null;
-                var sku = row.getAttribute('data-sku');
-                var link = row.querySelector('a[href*="/dp/"][target="_blank"]');
-                var asin = null, title = null;
-                if (link) {
-                    title = (link.innerText || '').trim();
-                    var m = link.getAttribute('href').match(/\\/dp\\/([A-Z0-9]{10})/);
-                    if (m) asin = m[1];
-                }
-                return {asin: asin, sku: sku, title: title};
-            """)
-            if fallback:
-                asin = asin or fallback.get('asin')
-                sku = sku or fallback.get('sku')
-                title = title or fallback.get('title')
-        
-        if not asin and not sku and not title:
-            print("  No product details found")
-            return None
-        
-        # Clean SKU - remove trailing words that get concatenated (e.g. "Product", "Listing", etc.)
-        if sku:
-            sku = re.sub(r'(Product|Listing|Inactive|Active|Offer|Request|Reason).*$', '', sku, flags=re.IGNORECASE).strip()
-        
-        print(f"  ASIN: {asin} | SKU: {sku} | Title: {title}")
-        
-        if panel_found:
-            req_click = driver.execute_script("""
-                var result = {success: false, method: 'not found', debug: []};
-                
-                var panel = document.querySelector('kat-panel');
-                if (!panel) panel = document.querySelector('[role="dialog"][aria-label="panel"]');
-                if (!panel) {
-                    var dialogs = document.querySelectorAll('[role="dialog"]');
-                    for (var d = 0; d < dialogs.length; d++) {
-                        if (dialogs[d].offsetParent !== null || dialogs[d].style.display !== 'none') {
-                            panel = dialogs[d]; break;
-                        }
-                    }
-                }
-                
-                if (!panel) return result;
-                
-                var buttons = panel.querySelectorAll('kat-button, button, a[role="button"], input[type="submit"]');
-                for (var i = 0; i < buttons.length; i++) {
-                    var targetBtn = buttons[i];
-                    if (targetBtn.hasAttribute('disabled') || targetBtn.getAttribute('aria-disabled') === 'true') continue;
-                    
-                    var btnText = (targetBtn.innerText || targetBtn.value || targetBtn.getAttribute('label') || '').toLowerCase();
-                    if (btnText.includes('request approval')) {
-                        result.success = true;
-                        result.element = targetBtn;
-                        return result;
-                    }
-                }
-                
-                return result;
-            """)
-                
-            if req_click.get('success'):
-                btn_elem = req_click.get('element')
-                if btn_elem:
-                    try:
-                        ActionChains(driver).move_to_element(btn_elem).click().perform()
-                        # print("  Clicked 'Request approval' in sidebar.")
-                    except Exception as e:
-                        print(f"  Failed to click 'Request approval': {e}")
-                time.sleep(5)
-            else:
-                print("  'Request approval' button not found in sidebar.")
-        
-        return {
-            'success': True,
-            'asin': asin,
-            'sku': sku,
-            'title': title,
-            'message': f"Clicked Fix via {click_result.get('method')}, panel_found={panel_found}"
-        }
-            
-    except Exception as e:
-        print(f"  Error: {e}")
-        return None
+def process_approval_for_asin(driver, asin, base_url, info, worksheet=None):
+    """Navigate directly to the approval URL for a given ASIN."""
 
+    title = info.get('title', 'Unknown')
+    sku = info.get('sku', 'Unknown')
 
-def process_approval_page(driver, asin, title, sku, worksheet=None):
-    """Process the approval page after clicking Fix listing issue."""
-    
+    approval_url = f"{base_url}hz/approvalrequest/restrictions/approve?asin={asin}&itemcondition=New"
+    print(f"\n  Opening approval page for ASIN {asin}...")
+    # print(f"  URL: {approval_url}")
+
+    driver.get(approval_url)
+    time.sleep(5)
+
     # Check what page we landed on
-    # current_url = driver.current_url
-    # page_title = driver.title
-    # print(f"  Current page: {page_title}")
-    
-    # Check page content
+    current_url = driver.current_url
+    page_title = driver.title
+    # print(f"  Current URL: {current_url}")
+    # print(f"  Page title: {page_title}")
 
+    # Check page content
     try:
         page_info = driver.execute_script("""
         var bodyText = document.body.innerText.toLowerCase();
@@ -542,23 +392,24 @@ def process_approval_page(driver, asin, title, sku, worksheet=None):
             has_request_approval: bodyText.includes('request approval'),
             has_submit: bodyText.includes('submit'),
             has_not_qualify: bodyText.includes('does not qualify'),
-            has_error: bodyText.includes('error') || bodyText.includes('something went wrong')
+            has_error: bodyText.includes('error') || bodyText.includes('something went wrong'),
+            snippet: document.body.innerText.substring(0, 300)
         };
         """)
-        
+
         # Attempt to click request approval button if text is present
         clicked_result = "Not attempted"
         if page_info.get('has_request_approval'):
             try:
                 clicked_result = driver.execute_script("""
-                    // Method 1: Find by data-csm attribute
+                    // Method 1: finding by data-csm attribute
                     var btn = document.querySelector('input[data-csm="saw-landing-page-request-approval-button-click"]');
-                    if (btn && !btn.disabled) {
+                    if (btn) {
                         btn.click();
                         return 'Clicked by data-csm attribute';
                     }
-                    
-                    // Method 2: Find by class and text
+
+                    // Method 2: finding by class and text
                     var spans = document.querySelectorAll('span.a-button-text');
                     for (var i = 0; i < spans.length; i++) {
                         if (spans[i].innerText.toLowerCase().includes('request approval')) {
@@ -572,64 +423,49 @@ def process_approval_page(driver, asin, title, sku, worksheet=None):
                             }
                         }
                     }
-                    
-                    // Method 3: Find button by text content
-                    var allButtons = document.querySelectorAll('button, input[type="submit"], input[type="button"]');
-                    for (var i = 0; i < allButtons.length; i++) {
-                        var btnText = (allButtons[i].innerText || allButtons[i].value || '').toLowerCase();
-                        if (btnText.includes('request approval') && !allButtons[i].disabled) {
-                            allButtons[i].click();
-                            return 'Clicked by button text search';
-                        }
-                    }
-                    
-                    // Method 4: Find by aria-label
-                    var ariaButtons = document.querySelectorAll('[aria-label*="approval"], [aria-label*="request"]');
-                    for (var i = 0; i < ariaButtons.length; i++) {
-                        if (!ariaButtons[i].disabled) {
-                            ariaButtons[i].click();
-                            return 'Clicked by aria-label';
-                        }
-                    }
-                    
-                    return 'Button not found or disabled';
+                    return 'Button not found';
                 """)
                 if "Clicked" in str(clicked_result):
-                    time.sleep(3)
+                    time.sleep(3)  # wait for next page/action to load
             except Exception as e:
-                print(f"  Error clicking request approval button: {e}")
-        
+                pass
+
         if "Clicked" in str(clicked_result):
-            # print(f"  Successfully clicked Request approval button")
+            # print(f"  ASIN {asin}: Clicked 'Request approval' ({clicked_result})")
             check_and_log_document_requirements(driver, asin, title, sku, worksheet)
         elif page_info.get('has_approved'):
-            print(f"  ASIN {asin}: Already approved")
+            print(f" ASIN {asin}: Already approved or approval page loaded!")
             if worksheet:
-                try: 
+                try:
                     worksheet.append_row([asin, sku, title, 'approved'])
-                    print(f"  Saved to Google Sheet: {asin} -> approved")
-                except: pass
+                except:
+                    pass
         elif page_info.get('has_not_qualify'):
             print(f"  ASIN {asin}: Account does not qualify")
             if worksheet:
-                try: 
+                try:
                     worksheet.append_row([asin, sku, title, 'does_not_qualify'])
-                    print(f"  Saved to Google Sheet: {asin} -> does_not_qualify")
-                except: pass
+                except:
+                    pass
         elif page_info.get('has_selling_application'):
             print(f"  ASIN {asin}: Selling application page loaded")
             check_and_log_document_requirements(driver, asin, title, sku, worksheet)
         elif page_info.get('has_request_approval'):
-            print(f"  ASIN {asin}: Request approval text found, but button missing or disabled")
+            print(f"   ASIN {asin}: Request approval text found, but button missing or disabled.")
         else:
-            print(f"  ASIN {asin}: Unknown page state")
-        
+            print(f"   ASIN {asin}: Page loaded, check snippet below")
+
+        # print(f"  Page snippet: {page_info.get('snippet', 'N/A')[:200]}")
+
     except Exception as e:
         print(f"  Error checking page: {e}")
-    
+
     return True
 
 
+def get_processed_asins_from_csv(csv_filename):
+    """(Deprecated) Local CSV storage has been disabled."""
+    return set()
 
 
 def process_row(profile, worksheet=None, df_worksheet=None):
@@ -643,9 +479,16 @@ def process_row(profile, worksheet=None, df_worksheet=None):
         # Get base URL from store config
         amazon_home = profile.get('Amazon Home Page Link', 'https://sellercentral.amazon.com/home')
         base_url = amazon_home.replace("home", "")
-        
-        # Open first page with approval required filter
-        open_approval_required_inventory(driver, base_url, page_number=1)
+
+        # Build URL with status=approval_required directly (no need for dropdown filter)
+        page_size = 10
+        base_inventory_url = f"{base_url}myinventory/inventory/views/fix-issues?fulfilledBy=all&pageSize={page_size}&sort=date_created_desc&status=approval_required"
+
+        # First page load
+        first_page_url = f"{base_inventory_url}&page=1"
+        print(f"Opening: {first_page_url}")
+        driver.get(first_page_url)
+        time.sleep(5)
 
         # Close extra tabs
         main_handle = driver.current_window_handle
@@ -662,100 +505,84 @@ def process_row(profile, worksheet=None, df_worksheet=None):
         store_name = str(profile.get('profile_name', 'Unknown')).strip()
         print(f"Initiating process for store: {store_name}")
 
-        # Load processed ASINs from today's Google Sheet (current worksheet)
+        # Load processed ASINs only from today's sheet (current worksheet)
+        # This ensures each day gets fresh processing, but prevents duplicates within same day
         all_processed_asins = set()
-        
+
         if df_worksheet is not None and not df_worksheet.empty and 'ASIN' in df_worksheet.columns:
             today_asins = set(df_worksheet['ASIN'].astype(str).str.strip().tolist())
             all_processed_asins.update(today_asins)
-            print(f"  {len(today_asins)} ASINs already processed today.")
+            print(f"  Loaded {len(today_asins)} ASINs from today's sheet (will skip duplicates within same day).")
+
+        if all_processed_asins:
+            print(f"  Total {len(all_processed_asins)} ASINs already processed today.")
         else:
-            print(f"  Fresh start - no ASINs processed yet.")
+            print(f"  Fresh start - no ASINs processed yet today.")
         current_page = 1
         total_processed = 0
         total_skipped = 0
 
         while True:
-            # print(f"\n{'='*50}")
+            print(f"\n{'=' * 50}")
             print(f"  PAGE {current_page}")
-            # print(f"{'='*50}")
+            print(f"{'=' * 50}")
 
             # For pages after the first, navigate to the next page
             if current_page > 1:
-                open_approval_required_inventory(driver, base_url, page_number=current_page)
+                next_page_url = f"{base_inventory_url}&page={current_page}"
+                print(f"  Navigating to page {current_page}...")
+                driver.get(next_page_url)
+                time.sleep(6)
 
-            # Count products on current page using div[data-sku] selector
-            product_count = driver.execute_script("""
-                var rows = document.querySelectorAll('div[data-sku]');
-                return rows.length;
-            """)
-            
-            print(f"  Products found on page {current_page}: {product_count}")
-            
-            if product_count == 0:
-                print(f"  No products found on page {current_page}. All pages processed!")
+            # Extract ASINs from current page
+            asins_info = extract_asins(driver)
+
+            if not asins_info:
+                print(f"  No ASINs found on page {current_page}. All pages processed!")
                 break
 
-            # Process each product one by one
-            for idx in range(product_count):
-                print(f"\n  Processing product {idx + 1} of {product_count}...")
-                
-                # No page refresh - just click Nth product on the same page
-                product_result = extract_first_product_and_click_fix_listing(driver, product_index=idx)
-                
-                if product_result and product_result.get('success'):
-                    asin = product_result.get('asin')
-                    sku = product_result.get('sku', 'Unknown')
-                    title = product_result.get('title', 'Unknown')
-                    
-                    print(f"  Product {idx + 1}: ASIN={asin}, SKU={sku}")
-                    
-                    if asin in all_processed_asins:
-                        print(f"  SKIP: {asin} already processed")
-                        total_skipped += 1
-                        continue
-                    
-                    time.sleep(3)
-                    
-                    handles_after = driver.window_handles
-                    if len(handles_after) > 1:
-                        new_tab = [h for h in handles_after if h != main_handle][-1]
-                        driver.switch_to.window(new_tab)
-                    
-                    time.sleep(3)
-                    process_approval_page(driver, asin, title, sku, worksheet)
-                    
-                    try:
-                        current_handles = driver.window_handles
-                        if len(current_handles) > 1:
-                            for h in current_handles:
-                                if h != main_handle:
-                                    try:
-                                        driver.switch_to.window(h)
-                                        driver.close()
-                                    except: pass
-                        driver.switch_to.window(main_handle)
-                    except Exception as tab_err:
-                        print(f"  Error returning to inventory: {tab_err}")
-                    
-                    all_processed_asins.add(asin)
-                    total_processed += 1
+            # Filter out already processed ASINs (duplicate check)
+            new_asins = {}
+            for asin, info in asins_info.items():
+                if asin in all_processed_asins:
+                    print(f"  SKIP (duplicate): {asin} already processed")
+                    total_skipped += 1
                 else:
-                    print(f"  Failed to extract or click product")
-                    break
-                
-                time.sleep(2)
+                    new_asins[asin] = info
+
+            if not new_asins:
+                print(f"  All ASINs on page {current_page} are duplicates. Moving to next page.")
+                current_page += 1
+                continue
+
+            print(f"  New ASINs to process on page {current_page}: {len(new_asins)}")
+
+            # Process each new ASIN
+            for asin, info in new_asins.items():
+                process_approval_for_asin(driver, asin, base_url, info, worksheet)
+                all_processed_asins.add(asin)
+                total_processed += 1
+                time.sleep(1.5)
 
             # Move to next page
             current_page += 1
 
         # ====== SUMMARY ======
-        print(f"\n{'='*50}")
+        print(f"\n{'=' * 50}")
         print(f"  Execution Complete. Summary:")
         print(f"  Total pages scanned: {current_page}")
         print(f"  Total ASINs processed: {total_processed}")
         print(f"  Total ASINs skipped (duplicates): {total_skipped}")
-        print(f"{'='*50}")
+        print(f"{'=' * 50}")
+
+        # Keep browser open so user can see result
+        print("\nKeeping browser open for 8 seconds...")
+        time.sleep(8)
+
+        result['success'] = True
+        result['processed'] = total_processed
+        result['skipped'] = total_skipped
+        result['pages'] = current_page
 
     except Exception as e:
         import traceback
@@ -769,17 +596,15 @@ def process_row(profile, worksheet=None, df_worksheet=None):
                 driver.close()
             except:
                 pass
+        try:
+            driver.quit()
+        except:
+            pass
         return result
 
-def main():
 
-    try:
-        df = pd.read_csv('stores.csv')
-        print(f"Loaded {len(df)} stores from stores.csv")
-    except Exception as e:
-        print(f"Error reading stores.csv: {e}")
-        return
-    
+def main():
+    df = pd.read_csv('stores.csv')
     active = df[df['status'] == 1]
 
     if len(active) == 0:
@@ -787,75 +612,8 @@ def main():
         return
 
     profile = active.iloc[0]
-    print(f"Active store found: {profile.get('profile_name', 'Unknown')}")
-    
-    # Setup Google Sheets and Drive
-    worksheet = None
-    df_worksheet = None
-    
-    try:
-        # Import from approval.py (local import to avoid circular dependency)
-        from approval import authenticate_gspread, authenticate_pydrive, get_or_create_folder, get_or_create_sheet_in_folder
-        
-        print("\nAuthenticating with Google Sheets and Drive...")
-        gc = authenticate_gspread()
-        drive = authenticate_pydrive()
-        print("Authentication successful")
-        
-        # Get or create "Bot Approval Local" folder
-        print("\nSetting up Bot Approval Local folder...")
-        bot_files_folder_id = get_or_create_folder("Bot Approval Local", drive)
-        
-        if bot_files_folder_id:
-            # Create sheet name with current date
-            current_date = datetime.now().strftime('%Y-%m-%d')
-            sheet_name = f"{profile['profile_name']}_{current_date}"
-            
-            print(f"Creating/accessing sheet: {sheet_name}")
-            
-            # Get or create sheet in folder
-            sheet_id = get_or_create_sheet_in_folder(sheet_name, bot_files_folder_id, drive)
-            sh = gc.open_by_key(sheet_id)
-            
-            # Get or create the first worksheet
-            try:
-                worksheet = sh.get_worksheet(0)
-            except:
-                worksheet = sh.add_worksheet(title="Sheet1", rows="1000000", cols="4")
-            
-            # Check if header exists, if not write it
-            header = worksheet.row_values(1)
-            if not header or 'ASIN' not in header:
-                worksheet.insert_row(['ASIN', 'SKU', 'Title', 'Status'], 1)
-                print("Header row created in sheet")
-            
-            # Load existing records for duplicate checking
-            records = worksheet.get_all_records()
-            df_worksheet = pd.DataFrame(records) if records else pd.DataFrame(columns=['ASIN', 'SKU', 'Title', 'Status'])
-            
-            print(f"Connected to Google Sheet: {sheet_name}")
-            print(f"Sheet URL: https://docs.google.com/spreadsheets/d/{sheet_id}")
-            print(f"Existing records in sheet: {len(df_worksheet)}")
-        else:
-            print("Error: Could not create/access Bot Approval Local folder")
-            
-    except Exception as e:
-        print(f"Error setting up Google Sheets: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\nContinuing without Google Sheets (data will not be saved)...")
-    
-    # Process the store
-    print("\n" + "="*60)
-    print("Starting store processing...")
-    print("="*60 + "\n")
-    
-    try:
-        process_row(profile, worksheet, df_worksheet)
-    except Exception as e:
-        print(f"\nError during processing: {e}")
-        import traceback
-        traceback.print_exc()
+    process_row(profile)
+
 
 if __name__ == '__main__':
     main()
