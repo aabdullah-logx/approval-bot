@@ -488,8 +488,10 @@ def sign_in_if_needed(driver, profile):
         driver.get(f'{amazon_url}{settings.APPROVAL_PAGE_URL}')
         print(f"[sign_in_if_needed] Arrived at: {driver.current_url}")
 
+    except TimeoutException:
+        print("[sign_in_if_needed] 'Sign in' page not found (user likely already logged in) — skipping.")
     except Exception as e:
-        print(f"[sign_in_if_needed] ERROR encountered: {e}")
+        print(f"[sign_in_if_needed] Unexpected ERROR encountered: {e}")
 
 
 def get_store_credentials():
