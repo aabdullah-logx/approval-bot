@@ -4,6 +4,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# If LOCAL=True, store data is fetched from stores.csv (access_sc.py runs standalone)
+# If LOCAL=False, store data is fetched from Google Sheets (approval.py handles it)
+LOCAL = False
+
 AMAZON_SC_BASE_URL = os.getenv('AMAZON_SC_BASE_URL', 'https://sellercentral.amazon.com/')
 AMAZON_HOME = os.getenv('AMAZON_HOME', 'https://sellercentral.amazon.com/home')
 AMAZON_LOGIN_URL = os.getenv('AMAZON_LOGIN_URL', 'signin?ref_=scus_soa_wp_signin_n')

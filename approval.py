@@ -219,19 +219,34 @@ def set_profile_qr_key(store, drive):
 def run():
     while True:
         try:
-            df, drive, gc, store = get_stores()
+            # Check if LOCAL mode: fetch stores from CSV, otherwise from Google Sheets
+            if settings.LOCAL:
+                print("LOCAL mode: Fetching stores from stores.csv")
+                filtered_df = access_sc.get_local_stores()
+                if filtered_df is None or len(filtered_df) == 0:
+                    print('Nothing to Process (no active stores in CSV)')
+                    time.sleep(600)
+                    continue
+                store = None  # No Google Sheet store worksheet in LOCAL mode
+                df = filtered_df
+                gc = authenticate_gspread()
+                drive = authenticate_pydrive()
+            else:
+                df, drive, gc, store = get_stores()
+                filtered_df = df[(df['run'] == 1) & (df['server'] == server.server) & (df['server'] == server.server)]
 
-            filtered_df = df[(df['run'] == 1) & (df['server'] == server.server) & (df['server'] == server.server)]
             folder_id = settings.folder_id
             
-            # Get or create "Bot Approval files" folder in Google Drive
-            bot_files_folder_id = get_or_create_folder("Bot Approval files", drive)
+            # Get or create folder in Google Drive for result logging
+            folder_name = "Bot Approval Local" if settings.LOCAL else "Bot Approval files"
+            bot_files_folder_id = get_or_create_folder(folder_name, drive)
             
             if len(filtered_df.index) > 0:
 
                 for index, profile in filtered_df.iterrows():
 
-                    profile = set_profile_qr_key(profile, drive)
+                    if not settings.LOCAL:
+                        profile = set_profile_qr_key(profile, drive)
 
                     if profile is not None:
 
@@ -239,12 +254,14 @@ def run():
                         df_worksheet = None
                         for x in range(3):  # Let's retry 3 times maximum
                             try:
-                                store.update_cell(index + 2, df.columns.get_loc('update') + 1, 'running')
+                                # Only update store worksheet status when NOT in LOCAL mode
+                                if store is not None:
+                                    store.update_cell(index + 2, df.columns.get_loc('update') + 1, 'running')
                                 current_datetime = datetime.datetime.now(timezone)
                                 current_date = current_datetime.strftime('%Y-%m-%d')
                                 sheet_name = f"{profile['profile_name']}_{current_date}"
                                 
-                                # Create or get sheet directly in "Bot Approval files" folder
+                                # Create or get sheet directly in folder
                                 if bot_files_folder_id:
                                     sheet_id = get_or_create_sheet_in_folder(sheet_name, bot_files_folder_id, drive)
                                     sh = gc.open_by_key(sheet_id)
@@ -263,7 +280,7 @@ def run():
                                     records = worksheet.get_all_records()
                                     df_worksheet = pd.DataFrame(records) if records else pd.DataFrame(columns=['ASIN', 'SKU', 'Title', 'Status'])
                                 else:
-                                    print("Error: Bot Approval files folder not found")
+                                    print(f"Error: {folder_name} folder not found")
                                     worksheet = None
                                     df_worksheet = None
                                 
@@ -272,13 +289,13 @@ def run():
                                 print(f"Error connecting to Google Sheet/Drive (Attempt {x+1}/3): {e}")
                                 time.sleep(5)
                         
+                        # Now process the profile and pass the worksheet handle (which might be None)
+                        store_name = profile.get('profile_name', 'Unknown')
+
                         if worksheet is None:
                             connection_error_msg = f"*Access Alert: {store_name}*\nThe automation bot was unable to establish a connection with Google Sheets. Please verify the spreadsheet permissions and configuration."
                             slack_utils.send_slack_message(connection_error_msg)
                             print(f"Warning: Connection to Google Sheets failed for {store_name}.")
-
-                        # Now process the profile and pass the worksheet handle (which might be None)
-                        store_name = profile.get('profile_name', 'Unknown')
                         
                         start_msg = f"*Processing Started: {store_name}*\nThe automation bot has initiated the approval routine for this store."
                         # slack_utils.send_slack_message(start_msg)
@@ -293,28 +310,38 @@ def run():
                             )
                             slack_utils.send_slack_message(success_msg)
                             
-                            for x in range(5):
-                                try:
-                                    store.update_cell(index + 2, df.columns.get_loc('update') + 1, 'completed')
-                                    store.update_cell(index + 2, df.columns.get_loc('run') + 1, 0)
-                                    current_datetime = datetime.datetime.now(timezone)
-                                    current_datetime_str = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                                    store.update_cell(index + 2, df.columns.get_loc('complete_on') + 1,
-                                                    current_datetime_str)
-                                except Exception as e:
-                                    print(f"Error marking as completed: {e}")
-                                    time.sleep(5)
-                                else:
-                                    break
+                            # Only update store worksheet when NOT in LOCAL mode
+                            if store is not None:
+                                for x in range(5):
+                                    try:
+                                        store.update_cell(index + 2, df.columns.get_loc('update') + 1, 'completed')
+                                        store.update_cell(index + 2, df.columns.get_loc('run') + 1, 0)
+                                        current_datetime = datetime.datetime.now(timezone)
+                                        current_datetime_str = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                                        store.update_cell(index + 2, df.columns.get_loc('complete_on') + 1,
+                                                        current_datetime_str)
+                                    except Exception as e:
+                                        print(f"Error marking as completed: {e}")
+                                        time.sleep(5)
+                                    else:
+                                        break
                         else:
                             error_details = result_dict.get('error', 'Unknown Error')
                             error_msg = f"*Error in Store: {store_name}*\nBot encountered an error during scraping:\n```{error_details}```"
                             slack_utils.send_slack_message(error_msg)
 
                 print('All tasks completed!')
+                
+                # In LOCAL mode, exit after processing all stores (CSV status isn't updated)
+                if settings.LOCAL:
+                    print("LOCAL mode complete. Exiting.")
+                    return
 
             else:
                 print('Nothing to Process')
+                if settings.LOCAL:
+                    print("LOCAL mode: No active stores in CSV. Exiting.")
+                    return
                 time.sleep(600)
         except Exception as e:
             # time.sleep(30)
