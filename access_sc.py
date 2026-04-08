@@ -36,12 +36,11 @@ def load_web_driver_with_gologin(profile_id):
         })
 
         debugger_address = gl.start()
+        time.sleep(5)
 
         chrome_options = Options()
         chrome_options.add_experimental_option("debuggerAddress", debugger_address)
-        chrome_options.add_argument("start-maximized")
-        chrome_options.add_argument("--window-size=1920x1080")
-        chrome_options.add_argument("--no-sandbox")
+
 
         if platform == "win32":
             local_chromedriver_path = os.getenv('CHROMEDRIVER_WINDOWS', 'chromedriver.exe')
