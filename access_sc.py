@@ -20,6 +20,21 @@ from get_totp import generate_2fa_code
 # Load environment variables
 load_dotenv()
 
+import socket
+
+def wait_for_port(host, port, timeout=999999):
+    print(f"Waiting for debug port {port}...")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            sock = socket.create_connection((host, port), timeout=1)
+            sock.close()
+            print(f"Port {port} is ready!")
+            return True
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            time.sleep(1)
+    return False
+
 
 def load_web_driver_with_gologin(profile_id):
     try:
@@ -36,6 +51,10 @@ def load_web_driver_with_gologin(profile_id):
         })
 
         debugger_address = gl.start()
+        print(f"Debugger address: {debugger_address}")
+        host, port = debugger_address.split(":")
+        wait_for_port(host, int(port))  # waits forever until ready
+
         time.sleep(5)
 
         chrome_options = Options()
