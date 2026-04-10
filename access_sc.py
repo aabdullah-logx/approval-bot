@@ -15,6 +15,8 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import pandas as pd
 from dotenv import load_dotenv
 import re
+import psutil
+import requests
 from get_totp import generate_2fa_code
 
 # Load environment variables
@@ -36,9 +38,61 @@ def wait_for_port(host, port, timeout=999999):
     return False
 
 
+def stop_existing_profile(profile_id):
+    """Stop any already-running GoLogin profile by killing its Orbita browser processes.
+    This ensures a clean start when the same profile is launched again."""
+    try:
+        tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
+        profile_folder = os.path.join(tmp_path, 'gologin_' + profile_id)
+
+        # Find and kill any Orbita/Chrome processes using this profile's user-data-dir
+        killed_count = 0
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline') or []
+                cmdline_str = ' '.join(cmdline)
+                # Check if this process is using our profile's data directory
+                if profile_id in cmdline_str and ('--user-data-dir' in cmdline_str or 'orbita' in cmdline_str.lower() or 'chrome' in proc.info.get('name', '').lower()):
+                    print(f"  Killing existing process PID={proc.info['pid']} for profile {profile_id}")
+                    proc.kill()
+                    proc.wait(timeout=10)
+                    killed_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                continue
+
+        if killed_count > 0:
+            print(f"  Killed {killed_count} existing process(es) for profile {profile_id}")
+            time.sleep(3)  # Give OS time to release file locks
+        else:
+            print(f"  No existing processes found for profile {profile_id}")
+
+        # Also try stopping via GoLogin API
+        try:
+            headers = {
+                'Authorization': 'Bearer ' + settings.token,
+                'User-Agent': 'Selenium-API'
+            }
+            requests.put(
+                f'https://api.gologin.com/browser/{profile_id}/stop',
+                headers=headers,
+                timeout=10
+            )
+            print(f"  Sent stop request to GoLogin API for profile {profile_id}")
+        except Exception as api_err:
+            print(f"  GoLogin API stop request note: {api_err}")
+
+    except Exception as e:
+        print(f"  Error stopping existing profile: {e}")
+
+
 def load_web_driver_with_gologin(profile_id):
     try:
         print(f"Launching GoLogin profile: {profile_id}")
+
+        # Stop any already-running instance of this profile first
+        print(f"  Checking for existing running profile...")
+        stop_existing_profile(profile_id)
+
         # Set a custom tmpdir to avoid path length or permission issues in Windows Temp
         tmp_path = os.path.join(os.getcwd(), 'gologin_temp')
         if not os.path.exists(tmp_path):
@@ -1183,18 +1237,13 @@ def process_row(profile, worksheet=None, df_worksheet=None):
     driver, gl = load_web_driver_with_gologin(profile['profile_id'])
 
     try:
-        # Get base URL from store config
-        amazon_home = profile.get('Amazon Home Page Link', 'https://sellercentral.amazon.com/home')
-        base_url = amazon_home.replace("home", "")
+        # Open the approval page using settings URL
+        approval_url = f"{settings.AMAZON_SC_BASE_URL}{settings.APPROVAL_PAGE_URL}"
+        print(f"Opening approval page: {approval_url}")
+        driver.get(approval_url)
+        time.sleep(6)
 
-        # Open first page with approval required filter
-        open_approval_required_inventory(driver, base_url, page_number=1)
 
-        # Check if Amazon is asking for sign-in after page load
-        sign_in_if_needed(driver, profile)
-        check_switch_account(driver, profile)
-
-        # Close extra tabs
         main_handle = driver.current_window_handle
         for handle in driver.window_handles:
             if handle != main_handle:
@@ -1204,6 +1253,49 @@ def process_row(profile, worksheet=None, df_worksheet=None):
                 except:
                     pass
         driver.switch_to.window(main_handle)
+        # Check if Amazon is asking for sign-in after page load
+        sign_in_if_needed(driver, profile)
+        check_switch_account(driver, profile)
+
+        # Select "Approval required" from the status dropdown filter
+        print("Selecting 'Approval required' filter from dropdown...")
+        try:
+            # Step 1: Click the dropdown header to open it
+            driver.execute_script("""
+                var dropdown = document.querySelector('kat-dropdown.FilterPanel-module__statusDropdown--0Aa7Y');
+                if (!dropdown) {
+                    // Fallback: find any kat-dropdown on the page
+                    dropdown = document.querySelector('kat-dropdown');
+                }
+                if (dropdown && dropdown.shadowRoot) {
+                    var header = dropdown.shadowRoot.querySelector('.select-header');
+                    if (header) {
+                        header.click();
+                    }
+                }
+            """)
+            time.sleep(2)
+
+            # Step 2: Click the "Approval required" option (value="ApprovalRequired")
+            driver.execute_script("""
+                var option = document.querySelector('kat-option[value="ApprovalRequired"]');
+                if (option) {
+                    option.click();
+                } else {
+                    // Fallback: search by text content
+                    var allOptions = document.querySelectorAll('kat-option');
+                    for (var i = 0; i < allOptions.length; i++) {
+                        if (allOptions[i].textContent.trim().toLowerCase().includes('approval required')) {
+                            allOptions[i].click();
+                            break;
+                        }
+                    }
+                }
+            """)
+            print("'Approval required' filter selected.")
+            time.sleep(6)  # Wait for the page to reload with filtered results
+        except Exception as filter_err:
+            print(f"Warning: Could not select approval filter: {filter_err}")
 
         store_name = str(profile.get('profile_name', 'Unknown')).strip()
         print(f"Initiating process for store: {store_name}")
@@ -1228,7 +1320,7 @@ def process_row(profile, worksheet=None, df_worksheet=None):
 
             # For pages after the first, navigate to the next page
             if current_page > 1:
-                open_approval_required_inventory(driver, base_url, page_number=current_page)
+                open_approval_required_inventory(driver, settings.AMAZON_SC_BASE_URL, page_number=current_page)
 
             # Count products on current page using div[data-sku] selector
             product_count = driver.execute_script("""
@@ -1311,12 +1403,25 @@ def process_row(profile, worksheet=None, df_worksheet=None):
         print(f"Error: {e}")
         result['error'] = str(e)
     finally:
-        for handle in driver.window_handles:
-            try:
-                driver.switch_to.window(handle)
-                driver.close()
-            except:
-                pass
+        # Close all browser tabs/windows
+        try:
+            for handle in driver.window_handles:
+                try:
+                    driver.switch_to.window(handle)
+                    driver.close()
+                except:
+                    pass
+        except:
+            pass
+
+        # Stop the GoLogin profile properly to release resources
+        try:
+            if gl:
+                gl.stop()
+                print(f"GoLogin profile stopped successfully.")
+        except Exception as stop_err:
+            print(f"Note: Could not stop GoLogin profile cleanly: {stop_err}")
+
         return result
 
 
